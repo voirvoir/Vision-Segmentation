@@ -1,0 +1,22 @@
+[project]
+name = "vision-backend"
+version = "0.1.0"
+description = "TCP backend server for real-time vision frame ingestion"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+	"Pillow>=10.0.0",
+]
+
+[project.scripts]
+vision-server = "vision_backend.server:main"
+
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = []
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vision_backend"]

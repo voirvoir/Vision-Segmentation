@@ -1,0 +1,27 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+
+# Local environment configuration
+.env
+.env.*
+!.env.example
+
+# Runtime logs and frame dumps
+logs/
+*.log
+
+# Test / coverage artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE/editor artifacts
+.vscode/
+.idea/
