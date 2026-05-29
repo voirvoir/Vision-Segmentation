@@ -15,7 +15,9 @@ venv/
 
 # Runtime logs and frame dumps
 logs/
+outputs/
 *.log
+*.pt
 
 # Test / coverage artifacts
 .pytest_cache/

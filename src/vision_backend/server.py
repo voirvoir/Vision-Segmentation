@@ -5,6 +5,15 @@ import asyncio
 import logging
 from contextlib import suppress
 
+from .detector import (
+    DEFAULT_CONF_THRESHOLD,
+    DEFAULT_IMAGE_SIZE,
+    DEFAULT_MAX_DETECTIONS,
+    DEFAULT_MODEL,
+    ObjectDetector,
+    UltralyticsDetector,
+    decode_image,
+)
 from .frame_logger import save_frame_for_debug
 from .protocol import VisionResult, unpack_frame_length
 
@@ -20,6 +29,9 @@ async def handle_client(
     writer: asyncio.StreamWriter,
     max_frame_bytes: int,
     frame_log_dir: str,
+    detector: ObjectDetector,
+    inference_lock: asyncio.Lock,
+    save_debug_frames: bool,
 ) -> None:
     peer = writer.get_extra_info("peername")
     LOGGER.info("Client connected: %s", peer)
@@ -33,9 +45,14 @@ async def handle_client(
             if frame_length > max_frame_bytes:
                 message = (
                     f"Frame too large ({frame_length} bytes). "
-                    f"Max allowed is {max_frame_bytes}.\n"
+                    f"Max allowed is {max_frame_bytes}."
                 )
-                writer.write(message.encode("utf-8"))
+                result = VisionResult.error_result(
+                    frame_id=frame_id + 1,
+                    error="frame_too_large",
+                    message=message,
+                )
+                writer.write(result.to_json_line())
                 await writer.drain()
                 LOGGER.warning("Rejected oversized frame from %s: %d", peer, frame_length)
                 break
@@ -50,23 +67,60 @@ async def handle_client(
                 len(frame),
             )
 
-            saved_frame = await asyncio.to_thread(
-                save_frame_for_debug,
-                frame,
-                frame_log_dir,
-                frame_id,
-                peer,
-            )
-            if saved_frame.was_jpeg:
-                LOGGER.info("Saved frame %d as JPEG: %s", frame_id, saved_frame.path)
-            else:
-                LOGGER.warning(
-                    "Frame %d is not a decodable image; saved raw bytes: %s",
+            if save_debug_frames:
+                saved_frame = await asyncio.to_thread(
+                    save_frame_for_debug,
+                    frame,
+                    frame_log_dir,
                     frame_id,
-                    saved_frame.path,
+                    peer,
                 )
+                if saved_frame.was_jpeg:
+                    LOGGER.info("Saved frame %d as JPEG: %s", frame_id, saved_frame.path)
+                else:
+                    LOGGER.warning(
+                        "Frame %d is not a decodable image; saved raw bytes: %s",
+                        frame_id,
+                        saved_frame.path,
+                    )
 
-            result = VisionResult(frame_id=frame_id, bytes_received=len(frame))
+            try:
+                image = await asyncio.to_thread(decode_image, frame)
+            except ValueError as exc:
+                result = VisionResult.error_result(
+                    frame_id=frame_id,
+                    error="invalid_image",
+                    message=str(exc),
+                    bytes_received=len(frame),
+                )
+                writer.write(result.to_json_line())
+                await writer.drain()
+                continue
+
+            try:
+                async with inference_lock:
+                    detection_result = await asyncio.to_thread(detector.detect, image)
+            except Exception as exc:
+                LOGGER.exception("Inference failed for frame %d from %s", frame_id, peer)
+                result = VisionResult.error_result(
+                    frame_id=frame_id,
+                    error="inference_failed",
+                    message=str(exc),
+                    bytes_received=len(frame),
+                )
+                writer.write(result.to_json_line())
+                await writer.drain()
+                continue
+
+            result = VisionResult(
+                frame_id=frame_id,
+                bytes_received=len(frame),
+                image_width=detection_result.image_width,
+                image_height=detection_result.image_height,
+                model=detection_result.model,
+                detections=detection_result.detections,
+                latency_ms=round(detection_result.latency_ms, 2),
+            )
             writer.write(result.to_json_line())
             await writer.drain()
 
@@ -87,13 +141,19 @@ async def run_server(
     port: int,
     max_frame_bytes: int,
     frame_log_dir: str,
+    detector: ObjectDetector,
+    save_debug_frames: bool,
 ) -> None:
+    inference_lock = asyncio.Lock()
     server = await asyncio.start_server(
         lambda r, w: handle_client(
             r,
             w,
             max_frame_bytes=max_frame_bytes,
             frame_log_dir=frame_log_dir,
+            detector=detector,
+            inference_lock=inference_lock,
+            save_debug_frames=save_debug_frames,
         ),
         host,
         port,
@@ -122,6 +182,39 @@ def parse_args() -> argparse.Namespace:
         help="Directory where received frames are dumped for debugging",
     )
     parser.add_argument(
+        "--no-frame-log",
+        action="store_true",
+        help="Disable saving received frames to disk for lower live VR latency",
+    )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help="Ultralytics model name or local checkpoint path",
+    )
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help='Inference device, for example "auto", "cpu", or "cuda:0"',
+    )
+    parser.add_argument(
+        "--conf-threshold",
+        default=DEFAULT_CONF_THRESHOLD,
+        type=float,
+        help="Minimum detection confidence",
+    )
+    parser.add_argument(
+        "--max-detections",
+        default=DEFAULT_MAX_DETECTIONS,
+        type=int,
+        help="Maximum detections returned per frame",
+    )
+    parser.add_argument(
+        "--imgsz",
+        default=DEFAULT_IMAGE_SIZE,
+        type=int,
+        help="Detector inference image size",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
@@ -138,12 +231,35 @@ def main() -> None:
     )
 
     try:
+        detector = UltralyticsDetector(
+            model_name=args.model,
+            device=args.device,
+            conf_threshold=args.conf_threshold,
+            max_detections=args.max_detections,
+            image_size=args.imgsz,
+        )
+    except RuntimeError as exc:
+        LOGGER.error("%s", exc)
+        raise SystemExit(1) from exc
+
+    LOGGER.info(
+        "Loaded detector model=%s device=%s conf=%.2f max_det=%d imgsz=%d",
+        detector.model_name,
+        detector.device,
+        detector.conf_threshold,
+        detector.max_detections,
+        detector.image_size,
+    )
+
+    try:
         asyncio.run(
             run_server(
                 host=args.host,
                 port=args.port,
                 max_frame_bytes=args.max_frame_bytes,
                 frame_log_dir=args.frame_log_dir,
+                detector=detector,
+                save_debug_frames=not args.no_frame_log,
             )
         )
     except KeyboardInterrupt:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 import re
@@ -29,7 +29,7 @@ def save_frame_for_debug(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     peer_text = _sanitize_for_filename(str(peer))
-    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+    stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S_%f")
     base_name = f"frame_{stamp}_{peer_text}_{frame_id:06d}"
 
     try:
